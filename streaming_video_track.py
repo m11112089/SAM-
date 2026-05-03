@@ -209,15 +209,12 @@ def _print_mem_stats(inference_state: dict, frame_idx: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main tracking loop
+# Main tracking loop (refactored into focused helpers)
 # ---------------------------------------------------------------------------
 
 
-def run_streaming_tracker(args: argparse.Namespace) -> None:  # noqa: C901
-    """Entry point for the streaming tracker pipeline."""
-    # ------------------------------------------------------------------
-    # Imports that require the full SAM2 installation
-    # ------------------------------------------------------------------
+def _build_predictor(args: argparse.Namespace):
+    """Build and return a streaming SAM2 predictor."""
     try:
         from sam2.build_sam import build_sam2_video_predictor
     except ImportError as exc:
@@ -227,80 +224,106 @@ def run_streaming_tracker(args: argparse.Namespace) -> None:  # noqa: C901
         )
         raise SystemExit(1) from exc
 
-    from sam2_plus.streaming_video_predictor import (
-        OcclusionAndDriftMonitor,
-        SAM2StreamingVideoPredictor,
-        TrackingState,
-        compute_frame_metrics,
-        render_frame,
-    )
+    from sam2_plus.streaming_video_predictor import SAM2StreamingVideoPredictor
 
     device = args.device or _auto_device()
     logger.info("Using device: %s", device)
-
-    # ------------------------------------------------------------------
-    # Build predictor
-    # ------------------------------------------------------------------
-    base_predictor = build_sam2_video_predictor(
-        args.config, args.checkpoint, device=device
-    )
+    base_predictor = build_sam2_video_predictor(args.config, args.checkpoint, device=device)
     predictor = SAM2StreamingVideoPredictor.from_predictor(base_predictor)
     predictor._image_size = args.resize
+    return predictor
 
-    # ------------------------------------------------------------------
-    # Open source
-    # ------------------------------------------------------------------
+
+def _init_tracking(predictor, args: argparse.Namespace):
+    """Read the first frame, init streaming state, add box prompt.
+
+    Returns ``(cap, inference_state, box, dst_w, dst_h, src_fps)``.
+    """
     cap = _open_source(args.source)
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     logger.info("Source: %dx%d @ %.1f fps", src_w, src_h, src_fps)
 
-    # ------------------------------------------------------------------
-    # Read and resize the first frame, init streaming state
-    # ------------------------------------------------------------------
     ret, first_bgr = cap.read()
     if not ret:
+        cap.release()
         raise RuntimeError("Could not read the first frame.")
 
     first_bgr = _resize_frame(first_bgr, args.resize)
     dst_h, dst_w = first_bgr.shape[:2]
 
     inference_state = predictor.init_stream_state(first_bgr)
-
-    # Scale box from source resolution to resized resolution
     box = _scale_box(args.box, (src_h, src_w), (dst_h, dst_w))
 
-    # Add the initial prompt (box on frame 0)
     with torch.inference_mode():
-        _, _, _ = predictor.add_new_points_or_box(
-            inference_state,
-            frame_idx=0,
-            obj_id=args.obj_id,
-            box=box,
+        predictor.add_new_points_or_box(
+            inference_state, frame_idx=0, obj_id=args.obj_id, box=box
         )
 
-    # ------------------------------------------------------------------
-    # Open output sink (if requested)
-    # ------------------------------------------------------------------
-    writer: Optional[cv2.VideoWriter] = None
-    if args.output:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.output, fourcc, src_fps, (dst_w, dst_h))
-        if not writer.isOpened():
-            logger.warning("Could not open VideoWriter for %s", args.output)
-            writer = None
+    return cap, inference_state, box, dst_w, dst_h, src_fps
 
-    # ------------------------------------------------------------------
-    # Tracking state helpers
-    # ------------------------------------------------------------------
+
+def _open_writer(args: argparse.Namespace, dst_w: int, dst_h: int, src_fps: float):
+    """Open a VideoWriter if ``--output`` was specified, else return None."""
+    if not args.output:
+        return None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(args.output, fourcc, src_fps, (dst_w, dst_h))
+    if not writer.isOpened():
+        logger.warning("Could not open VideoWriter for %s", args.output)
+        return None
+    return writer
+
+
+def _process_frame(predictor, inference_state, bgr, args, monitor, last_box):
+    """Run one tracking step and return ``(rendered, track_state, new_last_box, frame_idx)``."""
+    from sam2_plus.streaming_video_predictor import (
+        TrackingState,
+        compute_frame_metrics,
+        render_frame,
+    )
+
+    with torch.inference_mode():
+        frame_idx = predictor.append_frame(inference_state, bgr)
+        result = predictor.track_next_frame(inference_state, frame_idx, obj_id=args.obj_id)
+
+    mask = result["masks"][0]
+    box_out = result["boxes"][0]
+    score = result["scores"][0]
+
+    metrics = compute_frame_metrics(frame_idx, mask, box_out, score, prev_box=last_box)
+    track_state = monitor.update(metrics)
+
+    if track_state == TrackingState.TRACKING and box_out is not None:
+        last_box = box_out
+
+    rendered = render_frame(bgr, mask, box_out, frame_idx, track_state, score)
+    return rendered, track_state, last_box, frame_idx
+
+
+def _maybe_prune(predictor, inference_state, frame_idx: int, args: argparse.Namespace) -> None:
+    """Prune old state entries every *prune_every* frames."""
+    if args.prune_every > 0 and frame_idx > 0 and frame_idx % args.prune_every == 0:
+        keep_from = max(0, frame_idx - args.memory_window)
+        predictor.prune_stream_state(
+            inference_state, keep_from_frame_idx=keep_from, keep_conditioning=True
+        )
+        if args.print_prune_stats:
+            _print_mem_stats(inference_state, frame_idx)
+
+
+def run_streaming_tracker(args: argparse.Namespace) -> None:
+    """Entry point for the streaming tracker pipeline."""
+    from sam2_plus.streaming_video_predictor import OcclusionAndDriftMonitor
+
+    predictor = _build_predictor(args)
+    cap, inference_state, _box, dst_w, dst_h, src_fps = _init_tracking(predictor, args)
+    writer = _open_writer(args, dst_w, dst_h, src_fps)
     monitor = OcclusionAndDriftMonitor()
+
     last_box: Optional[np.ndarray] = None
     frame_count = 0
-
-    # ------------------------------------------------------------------
-    # Tracking loop
-    # ------------------------------------------------------------------
     logger.info("Starting streaming tracking loop…")
     t_start = time.perf_counter()
 
@@ -316,32 +339,9 @@ def run_streaming_tracker(args: argparse.Namespace) -> None:  # noqa: C901
                 break
 
             bgr = _resize_frame(bgr, args.resize)
-
-            # ---- Append frame to streaming state ----
-            with torch.inference_mode():
-                frame_idx = predictor.append_frame(inference_state, bgr)
-
-            # ---- Run one-step propagation ----
-            with torch.inference_mode():
-                result = predictor.track_next_frame(
-                    inference_state, frame_idx, obj_id=args.obj_id
-                )
-
-            mask = result["masks"][0]
-            box_out = result["boxes"][0]
-            score = result["scores"][0]
-
-            # ---- Update occlusion monitor ----
-            metrics = compute_frame_metrics(
-                frame_idx, mask, box_out, score, prev_box=last_box
+            rendered, _state, last_box, frame_idx = _process_frame(
+                predictor, inference_state, bgr, args, monitor, last_box
             )
-            track_state = monitor.update(metrics)
-
-            if track_state == TrackingState.TRACKING and box_out is not None:
-                last_box = box_out
-
-            # ---- Render ----
-            rendered = render_frame(bgr, mask, box_out, frame_idx, track_state, score)
 
             if writer is not None:
                 writer.write(rendered)
@@ -349,21 +349,11 @@ def run_streaming_tracker(args: argparse.Namespace) -> None:  # noqa: C901
             if not args.no_display:
                 cv2.imshow("SAM2 Streaming", rendered)
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or key == 27:  # q or ESC
+                if key == ord("q") or key == 27:
                     logger.info("User quit.")
                     break
 
-            # ---- Prune every N frames ----
-            if args.prune_every > 0 and frame_idx % args.prune_every == 0 and frame_idx > 0:
-                keep_from = max(0, frame_idx - args.memory_window)
-                predictor.prune_stream_state(
-                    inference_state,
-                    keep_from_frame_idx=keep_from,
-                    keep_conditioning=True,
-                )
-                if args.print_prune_stats:
-                    _print_mem_stats(inference_state, frame_idx)
-
+            _maybe_prune(predictor, inference_state, frame_idx, args)
             frame_count += 1
 
     finally:
@@ -375,12 +365,7 @@ def run_streaming_tracker(args: argparse.Namespace) -> None:  # noqa: C901
 
     elapsed = time.perf_counter() - t_start
     fps = frame_count / elapsed if elapsed > 0 else 0.0
-    logger.info(
-        "Done. Processed %d frames in %.1f s (%.1f fps).",
-        frame_count,
-        elapsed,
-        fps,
-    )
+    logger.info("Done. Processed %d frames in %.1f s (%.1f fps).", frame_count, elapsed, fps)
 
 
 # ---------------------------------------------------------------------------

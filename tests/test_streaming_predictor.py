@@ -221,9 +221,12 @@ class TestOcclusionAndDriftMonitor(unittest.TestCase):
 
     def test_recovery_from_occlusion(self):
         mon = OcclusionAndDriftMonitor(lost_grace_frames=10)
-        # Two occluded frames
-        for i in range(2):
-            mon.update(self._metrics(frame_idx=i, object_score=0.0))
+        # First occluded frame
+        state_1 = mon.update(self._metrics(frame_idx=0, object_score=0.0))
+        self.assertEqual(state_1, TrackingState.OCCLUDED)
+        # Second occluded frame – still OCCLUDED (grace period not exhausted)
+        state_2 = mon.update(self._metrics(frame_idx=1, object_score=0.0))
+        self.assertEqual(state_2, TrackingState.OCCLUDED)
         # Then tracking recovers
         state = mon.update(self._metrics(frame_idx=2, object_score=0.9))
         self.assertEqual(state, TrackingState.TRACKING)
@@ -449,8 +452,9 @@ class TestUtilHelpers(unittest.TestCase):
         box_prev = np.array([0, 0, 10, 10], dtype=np.float32)
         box_curr = np.array([10, 10, 20, 20], dtype=np.float32)
         m = compute_frame_metrics(1, mask=None, box=box_curr, score=0.9, prev_box=box_prev)
-        # Centers are (5,5) and (15,15) → distance ≈ 14.14
-        self.assertAlmostEqual(m.center_distance, np.sqrt(200), places=4)
+        # Centers: prev=(5,5), curr=(15,15) → distance = sqrt((15-5)^2 + (15-5)^2)
+        expected = np.sqrt((15.0 - 5.0) ** 2 + (15.0 - 5.0) ** 2)
+        self.assertAlmostEqual(m.center_distance, expected, places=4)
 
     def test_render_frame_returns_ndarray(self):
         bgr = np.zeros((64, 64, 3), dtype=np.uint8)

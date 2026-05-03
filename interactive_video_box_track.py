@@ -276,12 +276,12 @@ def _print_mem_stats(inference_state: dict, frame_idx: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main interactive tracking loop
+# Main interactive tracking loop (refactored into focused helpers)
 # ---------------------------------------------------------------------------
 
 
-def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
-    """Entry point for the interactive tracking pipeline."""
+def _build_interactive_predictor(args: argparse.Namespace):
+    """Build wrapped predictor and RollingFrameStore from args."""
     try:
         from sam2.build_sam import build_sam2_video_predictor
     except ImportError as exc:
@@ -291,24 +291,11 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
         )
         raise SystemExit(1) from exc
 
-    from sam2_plus.streaming_video_predictor import (
-        OcclusionAndDriftMonitor,
-        RollingFrameStore,
-        SAM2StreamingVideoPredictor,
-        TrackingState,
-        compute_frame_metrics,
-        render_frame,
-    )
+    from sam2_plus.streaming_video_predictor import RollingFrameStore, SAM2StreamingVideoPredictor
 
     device = args.device or _auto_device()
     logger.info("Using device: %s", device)
-
-    # ------------------------------------------------------------------
-    # Build predictor with rolling frame store
-    # ------------------------------------------------------------------
-    base_predictor = build_sam2_video_predictor(
-        args.config, args.checkpoint, device=device
-    )
+    base_predictor = build_sam2_video_predictor(args.config, args.checkpoint, device=device)
     predictor = SAM2StreamingVideoPredictor.from_predictor(base_predictor)
     predictor._image_size = args.resize
 
@@ -316,10 +303,34 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
         frame_buffer_size=args.frame_buffer_size,
         max_non_conditioning_frames=min(args.memory_window, args.frame_buffer_size),
     )
+    return predictor, frame_store
 
-    # ------------------------------------------------------------------
-    # Open source and read first frame
-    # ------------------------------------------------------------------
+
+def _get_initial_box(args: argparse.Namespace, first_bgr: np.ndarray,
+                     src_hw: tuple, dst_hw: tuple):
+    """Return the initial bounding box as a float32 numpy array [x1,y1,x2,y2].
+
+    Uses the CLI --box if provided; otherwise opens an interactive selector.
+    """
+    if args.box is not None:
+        return _scale_box(args.box, src_hw, dst_hw)
+
+    if args.no_display:
+        raise ValueError("Either --box or an interactive display is required.")
+
+    logger.info("Please draw a bounding box around the object to track.")
+    selector = BoxSelector(first_bgr)
+    raw_box = selector.select()
+    if raw_box is None:
+        raise RuntimeError("No box selected. Aborting.")
+    return np.array(raw_box, dtype=np.float32)
+
+
+def _init_interactive_tracking(predictor, frame_store, args: argparse.Namespace):
+    """Open source, read first frame, init state, add prompt.
+
+    Returns ``(cap, inference_state, dst_w, dst_h, src_fps)``.
+    """
     cap = _open_source(args.source)
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -328,50 +339,88 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
 
     ret, first_bgr = cap.read()
     if not ret:
+        cap.release()
         raise RuntimeError("Could not read the first frame.")
 
     first_bgr = _resize_frame(first_bgr, args.resize)
     dst_h, dst_w = first_bgr.shape[:2]
 
-    # ------------------------------------------------------------------
-    # Obtain initial bounding box (interactive or from CLI)
-    # ------------------------------------------------------------------
-    if args.box is not None:
-        box = _scale_box(args.box, (src_h, src_w), (dst_h, dst_w))
-    elif not args.no_display:
-        logger.info("Please draw a bounding box around the object to track.")
-        selector = BoxSelector(first_bgr)
-        raw_box = selector.select()
-        if raw_box is None:
-            logger.error("No box selected. Aborting.")
-            cap.release()
-            return
-        box = np.array(raw_box, dtype=np.float32)
-    else:
-        raise ValueError("Either --box or an interactive display is required.")
-
+    box = _get_initial_box(args, first_bgr, (src_h, src_w), (dst_h, dst_w))
     logger.info("Initial box: %s", box.tolist())
 
-    # ------------------------------------------------------------------
-    # Init streaming state and add the first-frame prompt
-    # ------------------------------------------------------------------
     inference_state = predictor.init_stream_state(first_bgr)
     frame_store.add(0, inference_state["images"][0])
-
-    with torch.inference_mode():
-        _, _, _ = predictor.add_new_points_or_box(
-            inference_state,
-            frame_idx=0,
-            obj_id=args.obj_id,
-            box=box,
-        )
-
-    # Frame 0 is a conditioning frame: pin it in the store
     frame_store.pin_conditioning(0)
 
-    # ------------------------------------------------------------------
-    # Output sink
-    # ------------------------------------------------------------------
+    with torch.inference_mode():
+        predictor.add_new_points_or_box(
+            inference_state, frame_idx=0, obj_id=args.obj_id, box=box
+        )
+
+    return cap, inference_state, dst_w, dst_h, src_fps
+
+
+def _process_interactive_frame(
+    predictor, inference_state, frame_store, bgr, args, monitor, last_box
+):
+    """Run one tracking step with keyframe promotion.
+
+    Returns ``(rendered, track_state, new_last_box, frame_idx)``.
+    """
+    from sam2_plus.streaming_video_predictor import (
+        TrackingState,
+        compute_frame_metrics,
+        render_frame,
+    )
+
+    with torch.inference_mode():
+        frame_idx = predictor.append_frame(inference_state, bgr)
+        result = predictor.track_next_frame(inference_state, frame_idx, obj_id=args.obj_id)
+
+    frame_store.add(frame_idx, inference_state["images"][frame_idx])
+
+    mask = result["masks"][0]
+    box_out = result["boxes"][0]
+    score = result["scores"][0]
+
+    metrics = compute_frame_metrics(frame_idx, mask, box_out, score, prev_box=last_box)
+    track_state = monitor.update(metrics)
+
+    if track_state == TrackingState.TRACKING and box_out is not None:
+        last_box = box_out
+        if frame_store.should_promote_keyframe(frame_idx, confidence=score, is_occluded=False):
+            frame_store.pin_conditioning(frame_idx)
+            logger.debug("Promoted frame %d as keyframe.", frame_idx)
+
+    rendered = render_frame(bgr, mask, box_out, frame_idx, track_state, score)
+    return rendered, track_state, last_box, frame_idx
+
+
+def _maybe_prune_interactive(
+    predictor, inference_state, frame_store, frame_idx: int, args: argparse.Namespace
+) -> None:
+    """Prune both inference_state and frame_store every *prune_every* frames."""
+    if args.prune_every > 0 and frame_idx > 0 and frame_idx % args.prune_every == 0:
+        keep_from = max(0, frame_idx - args.memory_window)
+        predictor.prune_stream_state(
+            inference_state, keep_from_frame_idx=keep_from, keep_conditioning=True
+        )
+        frame_store.prune_before(keep_from)
+        if args.print_prune_stats:
+            _print_mem_stats(inference_state, frame_idx)
+
+
+def run_interactive_tracker(args: argparse.Namespace) -> None:
+    """Entry point for the interactive tracking pipeline."""
+    import time
+
+    from sam2_plus.streaming_video_predictor import OcclusionAndDriftMonitor
+
+    predictor, frame_store = _build_interactive_predictor(args)
+    cap, inference_state, dst_w, dst_h, src_fps = _init_interactive_tracking(
+        predictor, frame_store, args
+    )
+
     writer: Optional[cv2.VideoWriter] = None
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -380,19 +429,10 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
             logger.warning("Could not open VideoWriter for %s", args.output)
             writer = None
 
-    # ------------------------------------------------------------------
-    # Tracking helpers
-    # ------------------------------------------------------------------
     monitor = OcclusionAndDriftMonitor()
     last_box: Optional[np.ndarray] = None
     frame_count = 0
-    import time
-
     t_start = time.perf_counter()
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
     logger.info("Starting interactive tracking loop…")
 
     try:
@@ -407,39 +447,9 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
                 break
 
             bgr = _resize_frame(bgr, args.resize)
-
-            # ---- Append frame ----
-            with torch.inference_mode():
-                frame_idx = predictor.append_frame(inference_state, bgr)
-
-            frame_store.add(frame_idx, inference_state["images"][frame_idx])
-
-            # ---- One-step propagation ----
-            with torch.inference_mode():
-                result = predictor.track_next_frame(
-                    inference_state, frame_idx, obj_id=args.obj_id
-                )
-
-            mask = result["masks"][0]
-            box_out = result["boxes"][0]
-            score = result["scores"][0]
-
-            # ---- Occlusion monitor ----
-            metrics = compute_frame_metrics(
-                frame_idx, mask, box_out, score, prev_box=last_box
+            rendered, _state, last_box, frame_idx = _process_interactive_frame(
+                predictor, inference_state, frame_store, bgr, args, monitor, last_box
             )
-            track_state = monitor.update(metrics)
-
-            if track_state == TrackingState.TRACKING and box_out is not None:
-                last_box = box_out
-                if frame_store.should_promote_keyframe(
-                    frame_idx, confidence=score, is_occluded=False
-                ):
-                    frame_store.pin_conditioning(frame_idx)
-                    logger.debug("Promoted frame %d as keyframe.", frame_idx)
-
-            # ---- Render ----
-            rendered = render_frame(bgr, mask, box_out, frame_idx, track_state, score)
 
             if writer is not None:
                 writer.write(rendered)
@@ -450,27 +460,11 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
                 if key == ord("q") or key == 27:
                     logger.info("User quit.")
                     break
-                # 'c' – request user correction
                 if key == ord("c"):
                     logger.info("User correction requested at frame %d.", frame_idx)
                     monitor.request_correction()
 
-            # ---- Prune ----
-            if (
-                args.prune_every > 0
-                and frame_idx > 0
-                and frame_idx % args.prune_every == 0
-            ):
-                keep_from = max(0, frame_idx - args.memory_window)
-                predictor.prune_stream_state(
-                    inference_state,
-                    keep_from_frame_idx=keep_from,
-                    keep_conditioning=True,
-                )
-                frame_store.prune_before(keep_from)
-                if args.print_prune_stats:
-                    _print_mem_stats(inference_state, frame_idx)
-
+            _maybe_prune_interactive(predictor, inference_state, frame_store, frame_idx, args)
             frame_count += 1
 
     finally:
@@ -482,12 +476,7 @@ def run_interactive_tracker(args: argparse.Namespace) -> None:  # noqa: C901
 
     elapsed = time.perf_counter() - t_start
     fps = frame_count / elapsed if elapsed > 0 else 0.0
-    logger.info(
-        "Done. Processed %d frames in %.1f s (%.1f fps).",
-        frame_count,
-        elapsed,
-        fps,
-    )
+    logger.info("Done. Processed %d frames in %.1f s (%.1f fps).", frame_count, elapsed, fps)
 
 
 # ---------------------------------------------------------------------------

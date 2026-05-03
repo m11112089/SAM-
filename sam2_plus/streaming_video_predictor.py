@@ -326,14 +326,19 @@ class FramePacket:
 class SAM2StreamingVideoPredictor:
     """Online, frame-by-frame SAM2-Plus tracker.
 
-    This class is designed as a subclass of ``SAM2VideoPredictor_Plus``, but
-    is written so that the pure-Python logic can be tested without a GPU.
-    When used for real tracking, instantiate via the normal SAM2 factory:
+    This class **wraps** an existing SAM2 predictor instance (via
+    :meth:`from_predictor`) and delegates all standard SAM2 calls to it, while
+    adding a streaming API for one-frame-at-a-time tracking.  It is designed
+    to be compatible with ``SAM2VideoPredictor_Plus`` but does not require
+    inheriting from it, so the file can be loaded even when SAM2 is not
+    installed.
 
-    .. code-block:: python
+    When used for real tracking, create a base predictor via the SAM2 factory
+    and wrap it::
 
         from sam2.build_sam import build_sam2_video_predictor
-        predictor = SAM2StreamingVideoPredictor(...)
+        base = build_sam2_video_predictor(config, checkpoint, device=device)
+        predictor = SAM2StreamingVideoPredictor.from_predictor(base)
 
     The streaming API consists of four methods:
 
@@ -342,11 +347,12 @@ class SAM2StreamingVideoPredictor:
     - :meth:`track_next_frame`   – run one propagation step for the new frame
     - :meth:`prune_stream_state` – evict old frames/outputs to bound memory
 
-    Subclassing note
-    ----------------
-    ``SAM2VideoPredictor_Plus`` is imported lazily so this file is loadable
-    even when SAM2 is not installed.  When SAM2 *is* installed, the real
-    subclassing happens inside :meth:`_get_base_class`.
+    Implementation note on internal SAM2 APIs
+    ------------------------------------------
+    :meth:`_build_state_from_predictor` calls the private ``_init_state``
+    method on the wrapped predictor because SAM2 does not expose a public API
+    for bootstrapping state from a pre-loaded image list.  If the SAM2 API
+    changes, the fallback path (stub state) is used automatically.
     """
 
     # ------------------------------------------------------------------
@@ -585,8 +591,9 @@ class SAM2StreamingVideoPredictor:
             rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
         tensor = torch.from_numpy(rgb)
-        # Guard against test stubs that return bare numpy arrays from from_numpy
-        if not hasattr(tensor, "permute"):
+        # Use isinstance check to detect real tensors vs test stubs that
+        # return plain numpy arrays from torch.from_numpy.
+        if isinstance(tensor, np.ndarray):
             return tensor
         return tensor.permute(2, 0, 1).float().div(255.0)
 
