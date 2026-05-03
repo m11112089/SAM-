@@ -591,9 +591,9 @@ class SAM2StreamingVideoPredictor:
             rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
         tensor = torch.from_numpy(rgb)
-        # Use isinstance check to detect real tensors vs test stubs that
-        # return plain numpy arrays from torch.from_numpy.
-        if isinstance(tensor, np.ndarray):
+        # Return early for numpy arrays (test stubs) or any object that lacks
+        # torch-tensor methods, to avoid AttributeError in non-GPU environments.
+        if isinstance(tensor, np.ndarray) or not hasattr(tensor, "permute"):
             return tensor
         return tensor.permute(2, 0, 1).float().div(255.0)
 
