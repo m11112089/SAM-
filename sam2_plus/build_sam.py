@@ -117,6 +117,42 @@ def build_sam2_video_predictor_plus(
     return model
 
 
+def build_sam2_streaming_video_predictor_plus(
+    config_file,
+    ckpt_path=None,
+    device="cuda",
+    mode="eval",
+    hydra_overrides_extra=[],
+    apply_postprocessing=True,
+    task="mask",
+    **kwargs,
+):
+    hydra_overrides = [
+        "++model._target_=sam2_plus.streaming_video_predictor.SAM2StreamingVideoPredictor",
+    ]
+
+    if apply_postprocessing:
+        hydra_overrides_extra = hydra_overrides_extra.copy()
+        hydra_overrides_extra += [
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
+            "++model.binarize_mask_from_pts_for_mem_enc=true",
+            "++model.fill_hole_area=8",
+        ]
+    hydra_overrides.extend(hydra_overrides_extra)
+
+    cfg = compose(config_name=config_file, overrides=hydra_overrides)
+    OmegaConf.resolve(cfg)
+    model = instantiate(cfg.model, _recursive_=True)
+    _load_checkpoint(model, ckpt_path)
+    model = model.to(device)
+    model.task = task
+    if mode == "eval":
+        model.eval()
+    return model
+
+
 def _hf_download(model_id):
     from huggingface_hub import hf_hub_download
 
